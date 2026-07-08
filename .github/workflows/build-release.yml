@@ -1,0 +1,70 @@
+# XC_VM_Proxy — build & publish the release archive.
+#
+# Flow (avoids the "tag visible, assets not yet uploaded" race the panel could hit):
+#   1. maintainer creates a DRAFT release with a bare-semver tag (X.Y.Z)
+#   2. this workflow builds proxy.tar.gz + hashes, uploads them, then PUBLISHES
+#      (undraft) as the last step — unauthenticated GET /releases never returns
+#      drafts, so the panel only sees the tag once its assets exist.
+
+name: build-release
+
+on:
+  release:
+    types: [created]        # fires for draft creation as well as normal releases
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build, e.g. 1.2.3"
+        required: true
+
+permissions:
+  contents: write           # upload assets + publish the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reject non-bare-semver tags
+        run: |
+          t='${{ steps.tag.outputs.tag }}'
+          if ! [[ "$t" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$t' is not bare semver (X.Y.Z). The panel rejects v-prefixed / 4-part tags."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0        # tags needed for git describe / commit time
+
+      - name: Build archive
+        run: make build VERSION=${{ steps.tag.outputs.tag }}
+
+      - name: Verify reproducibility
+        run: make check-reproducible VERSION=${{ steps.tag.outputs.tag }}
+
+      - name: Smoke — archive is a valid gzip tar
+        run: tar -tzf dist/proxy.tar.gz >/dev/null && echo "OK: archive lists cleanly"
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            dist/proxy.tar.gz dist/hashes.md5 dist/hashes.sha256 \
+            --clobber
+
+      - name: Publish (undraft) — last, so assets always precede visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ steps.tag.outputs.tag }}" --draft=false
